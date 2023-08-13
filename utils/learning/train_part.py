@@ -16,8 +16,16 @@ from utils.model.varnet import VarNet
 
 import os
 
-def train_epoch(args, epoch, model, data_loader, optimizer, loss_type):
-    model.train()
+import losses
+import sampling
+import sde_lib
+import controllable_generation
+from models import utils as mutils
+from models.ema import ExponentialMovingAverage
+from sampling import (ReverseDiffusionPredictor, 
+                      LangevinCorrector)
+
+def train_epoch(args, epoch, train_step_fn, data_loader):
     start_epoch = start_iter = time.perf_counter()
     len_loader = len(data_loader)
     total_loss = 0.
@@ -28,12 +36,8 @@ def train_epoch(args, epoch, model, data_loader, optimizer, loss_type):
         kspace = kspace.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         maximum = maximum.cuda(non_blocking=True)
-
-        output = model(kspace, mask)
-        loss = loss_type(output, target, maximum)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        
+        loss = train_step_fn(state, kspace)
         total_loss += loss.item()
 
         if iter % args.report_interval == 0:
@@ -117,7 +121,42 @@ def train(args):
     device = torch.device(f'cuda:{args.GPU_NUM}' if torch.cuda.is_available() else 'cpu')
     torch.cuda.set_device(device)
     print('Current cuda device: ', torch.cuda.current_device())
-
+    
+    #############################
+    # Initialize model.
+    score_model = NCSNpp(config).to(device=device)
+    ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
+    optimizer = losses.get_optimizer(config, score_model.parameters())
+    
+    sde = sde_lib.subVPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
+    sampling_eps = 1e-3
+    
+    optimize_fn = losses.optimization_manager(config)
+    continuous = config.training.continuous
+    reduce_mean = config.training.reduce_mean
+    likelihood_weighting = config.training.likelihood_weighting
+    train_step_fn = losses.get_step_fn(sde, train=True, optimize_fn=optimize_fn,
+                                       reduce_mean=reduce_mean, continuous=continuous,
+                                       likelihood_weighting=likelihood_weighting)
+    eval_step_fn = losses.get_step_fn(sde, train=False, optimize_fn=optimize_fn,
+                                      reduce_mean=reduce_mean, continuous=continuous,
+                                      likelihood_weighting=likelihood_weighting)
+    
+    predictor = ReverseDiffusionPredictor #@param ["EulerMaruyamaPredictor", "AncestralSamplingPredictor", "ReverseDiffusionPredictor", "None"] {"type": "raw"}
+    corrector = LangevinCorrector #@param ["LangevinCorrector", "AnnealedLangevinDynamics", "None"] {"type": "raw"}
+    snr = 0.16 #@param {"type": "number"}
+    n_steps = 1 #@param {"type": "integer"}
+    probability_flow = False #@param {"type": "boolean"}
+    pc_inpainter = controllable_generation.get_pc_inpainter(sde,
+                                                            predictor, corrector,
+                                                            inverse_scaler,
+                                                            snr=snr,
+                                                            n_steps=n_steps,
+                                                            probability_flow=probability_flow,
+                                                            continuous=config.training.continuous,
+                                                            denoise=True)
+    #############################
+    
     model = VarNet(num_cascades=args.cascade, 
                    chans=args.chans, 
                    sens_chans=args.sens_chans)
