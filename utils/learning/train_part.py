@@ -16,6 +16,8 @@ from utils.model.varnet import VarNet
 
 import os
 
+import utils.model.fastmri as fastmri
+import config
 import losses
 import sampling
 import sde_lib
@@ -25,7 +27,7 @@ from models.ema import ExponentialMovingAverage
 from sampling import (ReverseDiffusionPredictor, 
                       LangevinCorrector)
 
-def train_epoch(args, epoch, train_step_fn, data_loader):
+def train_epoch(args, epoch, train_step_fn, data_loader, state):
     start_epoch = start_iter = time.perf_counter()
     len_loader = len(data_loader)
     total_loss = 0.
@@ -36,6 +38,10 @@ def train_epoch(args, epoch, train_step_fn, data_loader):
         kspace = kspace.cuda(non_blocking=True)
         target = target.cuda(non_blocking=True)
         maximum = maximum.cuda(non_blocking=True)
+        
+        b, c, h, w, two = kspace.shape
+        assert two == 2
+        kspace = kspace.view(b*c, h, w, 2).permute(0, 3, 1, 2)
         
         loss = train_step_fn(state, kspace)
         total_loss += loss.item()
@@ -52,8 +58,7 @@ def train_epoch(args, epoch, train_step_fn, data_loader):
     return total_loss, time.perf_counter() - start_epoch
 
 
-def validate(args, model, data_loader):
-    model.eval()
+def validate(args, score_model, pc_inpainter, data_loader):
     reconstructions = defaultdict(dict)
     targets = defaultdict(dict)
     start = time.perf_counter()
@@ -63,7 +68,18 @@ def validate(args, model, data_loader):
             mask, kspace, target, _, fnames, slices = data
             kspace = kspace.cuda(non_blocking=True)
             mask = mask.cuda(non_blocking=True)
-            output = model(kspace, mask)
+            
+            b, c, h, w, two = kspace.shape
+            assert two == 2
+            kspace = kspace.view(b*c, h, w, 2).permute(0, 3, 1, 2)
+            mask = mask.view(1, 1, 1, -1)
+            
+            output = pc_inpainter(score_model, kspace, mask)
+            output = output.permute(0, 2, 3, 1).view(b, c, h, w, 2)
+            result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
+            height = result.shape[-2]
+            width = result.shape[-1]
+            output = result[..., (height - 384) // 2 : 384 + (height - 384) // 2, (width - 384) // 2 : 384 + (width - 384) // 2]
 
             for i in range(output.shape[0]):
                 reconstructions[fnames[i]][int(slices[i])] = output[i].cpu().numpy()
@@ -123,10 +139,12 @@ def train(args):
     print('Current cuda device: ', torch.cuda.current_device())
     
     #############################
-    # Initialize model.
+    config = config.get_config()
+    
     score_model = NCSNpp(config).to(device=device)
     ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
     optimizer = losses.get_optimizer(config, score_model.parameters())
+    state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
     
     sde = sde_lib.subVPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
     sampling_eps = 1e-3
@@ -156,30 +174,6 @@ def train(args):
                                                             continuous=config.training.continuous,
                                                             denoise=True)
     #############################
-    
-    model = VarNet(num_cascades=args.cascade, 
-                   chans=args.chans, 
-                   sens_chans=args.sens_chans)
-    model.to(device=device)
-
-    """
-    # using pretrained parameter
-    VARNET_FOLDER = "https://dl.fbaipublicfiles.com/fastMRI/trained_models/varnet/"
-    MODEL_FNAMES = "brain_leaderboard_state_dict.pt"
-    if not Path(MODEL_FNAMES).exists():
-        url_root = VARNET_FOLDER
-        download_model(url_root + MODEL_FNAMES, MODEL_FNAMES)
-    
-    pretrained = torch.load(MODEL_FNAMES)
-    pretrained_copy = copy.deepcopy(pretrained)
-    for layer in pretrained_copy.keys():
-        if layer.split('.',2)[1].isdigit() and (args.cascade <= int(layer.split('.',2)[1]) <=11):
-            del pretrained[layer]
-    model.load_state_dict(pretrained)
-    """
-
-    loss_type = SSIMLoss().to(device=device)
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
     best_val_loss = 1.
     start_epoch = 0
@@ -192,8 +186,8 @@ def train(args):
     for epoch in range(start_epoch, args.num_epochs):
         print(f'Epoch #{epoch:2d} ............... {args.net_name} ...............')
         
-        train_loss, train_time = train_epoch(args, epoch, model, train_loader, optimizer, loss_type)
-        val_loss, num_subjects, reconstructions, targets, inputs, val_time = validate(args, model, val_loader)
+        train_loss, train_time = train_epoch(args, epoch, train_step_fn, train_loader, state)
+        val_loss, num_subjects, reconstructions, targets, inputs, val_time = validate(args, score_model, pc_inpainter, val_loader)
         
         val_loss_log = np.append(val_loss_log, np.array([[epoch, val_loss]]), axis=0)
         file_path = os.path.join(args.val_loss_dir, "val_loss_log")
@@ -210,7 +204,7 @@ def train(args):
         is_new_best = val_loss < best_val_loss
         best_val_loss = min(best_val_loss, val_loss)
 
-        save_model(args, args.exp_dir, epoch + 1, model, optimizer, best_val_loss, is_new_best)
+#         save_model(args, args.exp_dir, epoch + 1, model, optimizer, best_val_loss, is_new_best)
         print(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
             f'ValLoss = {val_loss:.4g} TrainTime = {train_time:.4f}s ValTime = {val_time:.4f}s',
