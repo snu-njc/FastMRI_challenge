@@ -16,12 +16,13 @@ from utils.model.varnet import VarNet
 
 import os
 
-import utils.model.fastmri as fastmri
-import config
+import fastmri as fastmri
+import config_file
 import losses
 import sampling
 import sde_lib
 import controllable_generation
+from models import ddpm, ncsnv2, ncsnpp
 from models import utils as mutils
 from models.ema import ExponentialMovingAverage
 from sampling import (ReverseDiffusionPredictor, 
@@ -34,14 +35,12 @@ def train_epoch(args, epoch, train_step_fn, data_loader, state):
 
     for iter, data in enumerate(data_loader):
         mask, kspace, target, maximum, _, _ = data
-        mask = mask.cuda(non_blocking=True)
-        kspace = kspace.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        maximum = maximum.cuda(non_blocking=True)
         
         b, c, h, w, two = kspace.shape
         assert two == 2
         kspace = kspace.view(b*c, h, w, 2).permute(0, 3, 1, 2)
+        kspace = kspace[:, :, :, w//2 - 192 : w//2 + 192]
+        kspace = kspace.cuda(non_blocking=True)
         
         loss = train_step_fn(state, kspace)
         total_loss += loss.item()
@@ -61,29 +60,39 @@ def train_epoch(args, epoch, train_step_fn, data_loader, state):
 def validate(args, score_model, pc_inpainter, data_loader):
     reconstructions = defaultdict(dict)
     targets = defaultdict(dict)
-    start = time.perf_counter()
+    start_iter = start = time.perf_counter()
 
     with torch.no_grad():
         for iter, data in enumerate(data_loader):
             mask, kspace, target, _, fnames, slices = data
-            kspace = kspace.cuda(non_blocking=True)
-            mask = mask.cuda(non_blocking=True)
             
             b, c, h, w, two = kspace.shape
             assert two == 2
             kspace = kspace.view(b*c, h, w, 2).permute(0, 3, 1, 2)
+            kspace = kspace[:, :, :, w//2 - 192 : w//2 + 192]
             mask = mask.view(1, 1, 1, -1)
+            mask = mask[:, :, :, w//2 - 192 : w//2 + 192]
+            kspace = kspace.cuda(non_blocking=True)
+            mask = mask.cuda(non_blocking=True)
             
             output = pc_inpainter(score_model, kspace, mask)
-            output = output.permute(0, 2, 3, 1).view(b, c, h, w, 2)
-            result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(kspace_pred)), dim=1)
+            output = output.permute(0, 2, 3, 1).view(b, c, h, 384, 2)
+            result = fastmri.rss(fastmri.complex_abs(fastmri.ifft2c(output)), dim=1)
             height = result.shape[-2]
             width = result.shape[-1]
             output = result[..., (height - 384) // 2 : 384 + (height - 384) // 2, (width - 384) // 2 : 384 + (width - 384) // 2]
 
+            print(
+                f'Iter = [{iter:4d}/{len(data_loader):4d}] '
+                f'Time = {time.perf_counter() - start_iter:.4f}s',
+            )
+            start_iter = time.perf_counter()
+
             for i in range(output.shape[0]):
                 reconstructions[fnames[i]][int(slices[i])] = output[i].cpu().numpy()
                 targets[fnames[i]][int(slices[i])] = target[i].numpy()
+            if iter >= 10:
+                break
 
     for fname in reconstructions:
         reconstructions[fname] = np.stack(
@@ -137,18 +146,19 @@ def train(args):
     device = torch.device(f'cuda:{args.GPU_NUM}' if torch.cuda.is_available() else 'cpu')
     torch.cuda.set_device(device)
     print('Current cuda device: ', torch.cuda.current_device())
+    config = config_file.get_config()
     
-    #############################
-    config = config.get_config()
-    
-    score_model = NCSNpp(config).to(device=device)
+    print("defining models")
+    score_model = mutils.create_model(config)
     ema = ExponentialMovingAverage(score_model.parameters(), decay=config.model.ema_rate)
     optimizer = losses.get_optimizer(config, score_model.parameters())
     state = dict(optimizer=optimizer, model=score_model, ema=ema, step=0)
     
-    sde = sde_lib.subVPSDE(beta_min=config.model.beta_min, beta_max=config.model.beta_max, N=config.model.num_scales)
-    sampling_eps = 1e-3
+    print("defining sde")
+    sde = sde_lib.VESDE(sigma_min=config.model.sigma_min, sigma_max=config.model.sigma_max, N=config.model.num_scales)
+    sampling_eps = 1e-5
     
+    print("defining step functions")
     optimize_fn = losses.optimization_manager(config)
     continuous = config.training.continuous
     reduce_mean = config.training.reduce_mean
@@ -160,25 +170,23 @@ def train(args):
                                       reduce_mean=reduce_mean, continuous=continuous,
                                       likelihood_weighting=likelihood_weighting)
     
-    predictor = ReverseDiffusionPredictor #@param ["EulerMaruyamaPredictor", "AncestralSamplingPredictor", "ReverseDiffusionPredictor", "None"] {"type": "raw"}
-    corrector = LangevinCorrector #@param ["LangevinCorrector", "AnnealedLangevinDynamics", "None"] {"type": "raw"}
-    snr = 0.16 #@param {"type": "number"}
-    n_steps = 1 #@param {"type": "integer"}
-    probability_flow = False #@param {"type": "boolean"}
+    print("defining pc inpainter")
+    predictor = ReverseDiffusionPredictor
+    corrector = LangevinCorrector
+    snr = 0.16
+    n_steps = 1
+    probability_flow = False
     pc_inpainter = controllable_generation.get_pc_inpainter(sde,
                                                             predictor, corrector,
-                                                            inverse_scaler,
                                                             snr=snr,
                                                             n_steps=n_steps,
                                                             probability_flow=probability_flow,
                                                             continuous=config.training.continuous,
                                                             denoise=True)
-    #############################
 
     best_val_loss = 1.
     start_epoch = 0
 
-    
     train_loader = create_data_loaders(data_path = args.data_path_train, args = args, shuffle=True)
     val_loader = create_data_loaders(data_path = args.data_path_val, args = args)
     
