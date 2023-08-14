@@ -120,8 +120,7 @@ def train(args):
         print(f'Epoch #{epoch:2d} ............... {args.net_name} ...............')
         
         train_loss, train_time = train_epoch(args, epoch, train_step_fn, train_loader, state)
-        # we train on validation set.
-        val_loss, val_time = train_epoch(args, epoch, train_step_fn, val_loader, state)
+        val_loss, val_time = train_epoch(args, epoch, eval_step_fn, val_loader, state)
 
         train_loss = torch.tensor(train_loss).cuda(non_blocking=True)
         val_loss = torch.tensor(val_loss).cuda(non_blocking=True)
@@ -129,5 +128,5 @@ def train(args):
         save_model(args, args.exp_dir, epoch + 1, state)
         print(
             f'Epoch = [{epoch:4d}/{args.num_epochs:4d}] TrainLoss = {train_loss:.4g} '
-            f'TrainLoss2 = {val_loss:.4g} TrainTime = {train_time:.4f}s TrainTime2 = {val_time:.4f}s',
+            f'ValLoss = {val_loss:.4g} TrainTime = {train_time:.4f}s ValTime = {val_time:.4f}s',
         )
